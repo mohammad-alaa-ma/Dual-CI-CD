@@ -1,0 +1,184 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins
+  containers:
+  - name: jnlp
+    image: jenkins/inbound-agent:latest-jdk17
+    tty: true
+  - name: docker
+    image: docker:24.0.5-dind
+    securityContext:
+      privileged: true
+    tty: true
+"""
+        }
+    }
+
+    environment {
+        ECR_REPO = '609854511954.dkr.ecr.us-east-1.amazonaws.com/iti-gp-project'
+        AWS_REGION = 'us-east-1'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        TELEGRAM_BOT_TOKEN = credentials('telegram-bot-token')
+        TELEGRAM_CHAT_ID = credentials('telegram-chat-id')
+    }
+
+    stages {
+
+        stage('Clone Repository') {
+            steps {
+                git branch: 'main', url: 'https://github.com/mohammad-alaa-ma/iti-gp-project.git'
+            }
+        }
+
+        stage('Check Changes') {
+            steps {
+                script {
+                    def changes = sh(
+                        script: 'git diff --name-only HEAD~1 HEAD || echo "Dockerfile"',
+                        returnStdout: true
+                    ).trim()
+                    
+                    echo "Changed files: ${changes}"
+                    
+                    if (!changes.contains('Dockerfile') && !changes.contains('nodeapp/')) {
+                        currentBuild.result = 'SUCCESS'
+                        error('No relevant files changed. Skipping build.')
+                    }
+                    
+                    echo "Relevant files changed. Proceeding with build."
+                }
+            }
+        }
+
+        // 🧱 Stage 1: Build Docker Image
+        stage('Build Docker Image') {
+            steps {
+                container('docker') {
+                    sh '''
+echo "🔧 Building Docker image..."
+docker build -t $ECR_REPO:$IMAGE_TAG .
+docker tag $ECR_REPO:$IMAGE_TAG $ECR_REPO:latest
+echo "✅ Docker image built successfully: $ECR_REPO:$IMAGE_TAG"
+
+                    '''
+                }
+            }
+            post {
+                failure {
+                    sh '''
+                    TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+                    MESSAGE="🚨 Jenkins Build #${BUILD_NUMBER} Failed during Docker Build!%0A🕒 Time: ${TIMESTAMP}"
+                    curl -s -X POST https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage \
+                    -d chat_id=${TELEGRAM_CHAT_ID} -d text="$MESSAGE"
+                    
+                    '''
+                }
+            }
+        }
+
+        // 🔥 Stage 2: Smoke Test
+        stage('Smoke Test') {
+            steps {
+                container('docker') {
+                    sh '''
+                    set +x
+echo "🚀 Running smoke test..."
+# Start container (runs in background forever until we stop it)
+CONTAINER_ID=$(docker run -d -p 3000:3000 $ECR_REPO:$IMAGE_TAG)
+
+
+# Try curl 30 times against the running container
+for i in $(seq 1 30); do
+    # Install curl inside the running container
+    docker exec $CONTAINER_ID sh -c "apk add --no-cache curl"
+    RESPONSE=$(docker exec $CONTAINER_ID curl -sf http://localhost:3000 || true)
+    if [ -n "$RESPONSE" ]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🎯 SMOKE TEST SUCCESSFUL — APPLICATION RESPONSE:"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "📦 $RESPONSE"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "✅ Smoke Test Passed Successfully!"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    docker stop $CONTAINER_ID && docker rm $CONTAINER_ID
+    exit 0
+
+    fi
+    
+    echo "Retry $i/30..."
+    sleep 2
+done
+
+# Failed after 30 attempts
+docker logs $CONTAINER_ID
+docker stop $CONTAINER_ID && docker rm $CONTAINER_ID
+exit 1
+
+echo "✅ Smoke test passed!"
+docker stop $CONTAINER_ID
+docker rm $CONTAINER_ID
+                    '''
+                }
+            }
+            post {
+                failure {
+                    sh '''
+                    TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+                    MESSAGE="🚨 Jenkins Build #${BUILD_NUMBER} Failed during Smoke Test!%0A🕒 Time: ${TIMESTAMP}"
+                    curl -s -X POST https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage \
+                    -d chat_id=${TELEGRAM_CHAT_ID} -d text="$MESSAGE"
+                    '''
+                }
+            }
+        }
+
+        // ☁️ Stage 3: Push to AWS ECR
+        stage('Push to AWS ECR') {
+            steps {
+                container('docker') {
+                    withCredentials([usernamePassword(credentialsId: 'aws-ecr', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                        sh '''
+echo "☁️ Logging in to AWS ECR..."
+apk add --no-cache python3 py3-pip bash
+pip3 install --upgrade pip
+pip3 install awscli
+
+# Configure and login
+aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+aws configure set default.region $AWS_REGION
+aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPO
+
+echo "📦 Pushing image to ECR..."
+docker push $ECR_REPO:$IMAGE_TAG
+docker push $ECR_REPO:latest
+echo "✅ Image pushed successfully to AWS ECR."
+
+                        '''
+                    }
+                }
+            }
+            post {
+                failure {
+                    sh '''
+                    TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+                    MESSAGE="🚨 Jenkins Build #${BUILD_NUMBER} Failed during ECR Push!%0A🕒 Time: ${TIMESTAMP}"                  
+                    curl -s -X POST https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage \
+                    -d chat_id=${TELEGRAM_CHAT_ID} -d text="$MESSAGE"
+                    '''
+                }
+            }
+        }
+    }
+}
+
+
