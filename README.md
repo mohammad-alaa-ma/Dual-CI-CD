@@ -1,6 +1,7 @@
 # Flowchart for Both CI/CD Pipelines
 
 <img width="1366" height="2572" alt="Image" src="https://github.com/user-attachments/assets/ecd62c47-eb2f-45a7-a77c-30150312dbc1" />
+
 ![Line](./Screenshots/Jenkinsfile.terraform/0.png)
 
 # First CI for provisioning Infra using Terraform
